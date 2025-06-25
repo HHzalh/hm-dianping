@@ -1,29 +1,15 @@
 package com.hmdp.utils;
 
-import cn.hutool.core.bean.BeanUtil;
-import cn.hutool.core.util.StrUtil;
-import com.hmdp.dto.UserDTO;
-import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.web.servlet.HandlerInterceptor;
 
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
-import java.util.Map;
-import java.util.concurrent.TimeUnit;
 
 
 /**
  * 拦截器
  */
 public class LoginInterceptor implements HandlerInterceptor {
-
-    //不能注入，因为LoginInterceptor是我们new出来的对象（不是由Spring创建的对象）
-    private StringRedisTemplate stringRedisTemplate;
-
-    public LoginInterceptor(StringRedisTemplate stringRedisTemplate) {
-        this.stringRedisTemplate = stringRedisTemplate;
-    }
-
 
     /**
      * 请求处理前执行(登录拦截)
@@ -35,37 +21,14 @@ public class LoginInterceptor implements HandlerInterceptor {
      * @throws Exception
      */
     public boolean preHandle(HttpServletRequest request, HttpServletResponse response, Object handler) throws Exception {
-        //HttpSession session = request.getSession(); 获取session
-
-        //Object user = session.getAttribute(VariousConstants.USER); 获取session中的用户
-
-        //1.获取请求头中的token
-        String token = request.getHeader("authorization");
-        if (StrUtil.isBlank("token")) {
-            //不存在，拦截,返回401状态码
+        //1.判断是否需要拦截（ThreadLocal中是否有用户）
+        if (UserHolder.getUser() == null) {
+            //没有，需要拦截，设置状态码
             response.setStatus(401);
+            //拦截
             return false;
         }
-        //2.基于token获取redis中的用户
-        String key = RedisConstants.LOGIN_USER_KEY + token;
-        Map<Object, Object> userMap = stringRedisTemplate.opsForHash().entries(key);
-
-        //3.判断用户是否存在
-        if (userMap.isEmpty()) {
-            //4.不存在，拦截,返回401状态码
-            response.setStatus(401);
-            return false;
-        }
-        //5将查询到的Hash数据转换成UserDto对象
-        UserDTO userDTO = BeanUtil.fillBeanWithMap(userMap, new UserDTO(), false);
-
-
-        //6.存在，保存信用户信息到ThreadLocal
-        UserHolder.saveUser(userDTO);
-
-        //7.刷新token有效期 30分钟
-        stringRedisTemplate.expire(key, RedisConstants.LOGIN_USER_TTL, TimeUnit.MINUTES);
-        //8.放行
+        //有用户，放行
         return true;
     }
 
