@@ -10,9 +10,7 @@ import org.springframework.web.bind.annotation.RestController;
 import javax.annotation.Resource;
 
 /**
- * <p>
- * 前端控制器
- * </p>
+ * 店铺类型管理
  */
 @RestController
 @RequestMapping("/shop-type")
