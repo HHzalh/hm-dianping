@@ -858,5 +858,367 @@ public Result queryById(Long id) {
     }
 ```
 
+## 优惠卷秒杀
 
-是
+### Redis实现全局唯一ID
+
+- 在各类购物App中，都会遇到商家发放的优惠券
+
+- 当用户抢购商品时，生成的订单会保存到`tb_voucher_order`表中，而订单表如果使用数据库自增ID就会存在一些问题
+
+  - id规律性太明显
+  - 受单表数据量的限制
+
+- 如果我们的订单id有太明显的规律，那么对于用户或者竞争对手，就很容易猜测出我们的一些敏感信息，例如商城一天之内能卖出多少单，这显然是不合适的
+
+- 随着我们商城的规模越来越大，MySQL的单表容量不宜超过500W，数据量过大之后，我们就要进行拆库拆表，拆分表了之后，这些数据在逻辑上是一张表，所以他们的id不能重复，我们必须要保证id的唯一性，所以我们需要`全局ID生成器`来帮我们生成ID
+
+- 全局ID生成器是一种在分布式系统下用来生成全局唯一ID的工具，一般要满足一下特性
+
+  - 唯一性
+  - 高可用
+  - 高性能
+  - 递增性
+  - 安全性
+
+- 为了增加ID的安全性，我们可以不直接使用Redis自增的数值，而是拼接一些其他信息
+
+- ID组成部分
+
+  - 符号位：1bit，永远为0（代表正数）
+  - 时间戳：31bit，以秒为单位，可以使用69年（2^31秒约等于69年）
+  - 序列号：32bit，秒内的计数器，支持每秒传输2^32个不同ID
+
+  ```java
+  @Component
+  public class RedisIdWorker {
+      /**
+       * 开始时间戳
+       */
+      private static final long BEGIN_TIMESTAMP = 1640995200L;
+
+      /**
+       * 序列号的位数
+       */
+      private static final int COUNT_BITS = 32;
+
+      @Resource
+      private StringRedisTemplate stringRedisTemplate;
+
+      public static void main(String[] args) {
+          //设置起始时间，时间戳=起始时间-当前时间 的秒数差
+          LocalDateTime time = LocalDateTime.of(2022, 1, 1, 0, 0, 0);
+          long second = time.toEpochSecond(ZoneOffset.UTC);
+          System.out.println("second = " + second);
+          //结果为1640995200L
+      }
+
+      public long nextId(String keyPrefix) {
+          //1.生成时间戳
+          LocalDateTime now = LocalDateTime.now();
+          long nowSecond = now.toEpochSecond(ZoneOffset.UTC);
+          long timestamp = nowSecond - BEGIN_TIMESTAMP;
+          //2.生成序列号
+          //2.1获取当前的日期,精确到天
+          String date = now.format(DateTimeFormatter.ofPattern("yyyy:MM:dd"));
+          //2.2自增长日期
+          long count = stringRedisTemplate.opsForValue().increment("icr:" + keyPrefix + ":" + date);
+
+          //3.拼接并返回
+          return timestamp << COUNT_BITS | count;
+      }
+  }
+  ```
+
+- 编写单元测试
+
+```java
+@SpringBootTest
+class HmDianPingApplicationTests {
+
+    private final ExecutorService es = Executors.newFixedThreadPool(500);
+    
+    @Resource
+    private RedisIdWorker redisIdWorker;
+
+    @Test
+    void testIdWorker() throws InterruptedException {
+        // 用于等待所有任务完成，初始计数为300
+        CountDownLatch latch = new CountDownLatch(300);
+
+        Runnable task = () -> {
+            for (int i = 0; i < 100; i++) {
+                long id = redisIdWorker.nextId("order");
+                System.out.println("id = " + id);
+            }
+            // 每个任务完成后，将CountDownLatch的计数减1
+            latch.countDown();
+        };
+        // 记录开始时间
+        long begin = System.currentTimeMillis();
+        // 提交300个任务到线程池es
+        for (int i = 0; i < 300; i++) {
+            es.submit(task);
+        }
+        // 等待所有任务完成
+        latch.await();
+        // 记录结束时间
+        long end = System.currentTimeMillis();
+        System.out.println("time = " + (end - begin));
+    }
+}
+```
+
+- 测试成功
+
+![75267986985](assets/1752679869850.png)![75267993754](assets/1752679937541.png)
+
+- Redis自增ID策略
+
+  - 每天一个key，方便统计订单量
+  - ID构造是 时间戳+计数器
+
+  >全局唯一ID生成其他策略:
+  >
+  >- UUID
+  >- snowflake算法
+  >- 数据库自增​
+
+
+### 添加优惠卷
+
+- 每个店铺度可以发布优惠券，分为平价券和特价券，平价券可以任意购买，而特价券需要秒杀抢购
+- tb_voucher：优惠券的基本信息，优惠金额、使用规则等
+
+| Field        | Type             | Collation          | Null | Key  | Default           | Extra                                         | Comment                            |
+| ------------ | ---------------- | ------------------ | ---- | ---- | ----------------- | --------------------------------------------- | ---------------------------------- |
+| id           | bigint unsigned  | (NULL)             | NO   | PRI  | (NULL)            | auto_increment                                | 主键                               |
+| shop_id      | bigint unsigned  | (NULL)             | YES  |      | (NULL)            |                                               | 商铺id                             |
+| title        | varchar(255)     | utf8mb4_general_ci | NO   |      | (NULL)            |                                               | 代金券标题                         |
+| sub_title    | varchar(255)     | utf8mb4_general_ci | YES  |      | (NULL)            |                                               | 副标题                             |
+| rules        | varchar(1024)    | utf8mb4_general_ci | YES  |      | (NULL)            |                                               | 使用规则                           |
+| pay_value    | bigint unsigned  | (NULL)             | NO   |      | (NULL)            |                                               | 支付金额，单位是分。例如200代表2元 |
+| actual_value | bigint           | (NULL)             | NO   |      | (NULL)            |                                               | 抵扣金额，单位是分。例如200代表2元 |
+| type         | tinyint unsigned | (NULL)             | NO   |      | 0                 |                                               | 0,普通券；1,秒杀券                 |
+| status       | tinyint unsigned | (NULL)             | NO   |      | 1                 |                                               | 1,上架; 2,下架; 3,过期             |
+| create_time  | timestamp        | (NULL)             | NO   |      | CURRENT_TIMESTAMP | DEFAULT_GENERATED                             | 创建时间                           |
+| update_time  | timestamp        | (NULL)             | NO   |      | CURRENT_TIMESTAMP | DEFAULT_GENERATED on update CURRENT_TIMESTAMP | 更新时间                           |
+
+- tb_seckill_voucher：优惠券的库存、开始抢购时间，结束抢购时间。特价优惠券才需要填写这些信息
+
+| Field       | Type            | Collation | Null | Key  | Default           | Extra                                         | Comment          |
+| ----------- | --------------- | --------- | ---- | ---- | ----------------- | --------------------------------------------- | ---------------- |
+| voucher_id  | bigint unsigned | (NULL)    | NO   | PRI  | (NULL)            |                                               | 关联的优惠券的id |
+| stock       | int             | (NULL)    | NO   |      | (NULL)            |                                               | 库存             |
+| create_time | timestamp       | (NULL)    | NO   |      | CURRENT_TIMESTAMP | DEFAULT_GENERATED                             | 创建时间         |
+| begin_time  | timestamp       | (NULL)    | NO   |      | CURRENT_TIMESTAMP | DEFAULT_GENERATED                             | 生效时间         |
+| end_time    | timestamp       | (NULL)    | NO   |      | CURRENT_TIMESTAMP | DEFAULT_GENERATED                             | 失效时间         |
+| update_time | timestamp       | (NULL)    | NO   |      | CURRENT_TIMESTAMP | DEFAULT_GENERATED on update CURRENT_TIMESTAMP | 更新时间         |
+
+- 平价券由于优惠力度并不是很大，所以是可以任意领取
+- 而代金券由于优惠力度大，所以像第二种券，就得限制数量，从表结构上也能看出，特价券除了具有优惠券的基本信息以外，还具有库存，抢购时间，结束时间等等字段
+- 相关代码如下
+
+```java
+    /**
+     * 新增普通券
+     *
+     * @param voucher 优惠券信息
+     * @return 优惠券id
+     */
+    @PostMapping
+    public Result addVoucher(@RequestBody Voucher voucher) {
+        voucherService.save(voucher);
+        return Result.ok(voucher.getId());
+    }
+
+    /**
+     * 新增秒杀券
+     *
+     * @param voucher 优惠券信息，包含秒杀信息
+     * @return 优惠券id
+     */
+    @PostMapping("seckill")
+    public Result addSeckillVoucher(@RequestBody Voucher voucher) {
+        voucherService.addSeckillVoucher(voucher);
+        return Result.ok(voucher.getId());
+    }
+
+		 /**
+     * 秒杀优惠卷的逻辑
+     */
+    @Override
+    @Transactional
+    public void addSeckillVoucher(Voucher voucher) {
+        // 保存优惠券
+        save(voucher);
+        // 保存秒杀信息
+        SeckillVoucher seckillVoucher = new SeckillVoucher();
+        seckillVoucher.setVoucherId(voucher.getId());
+        seckillVoucher.setStock(voucher.getStock());
+        seckillVoucher.setBeginTime(voucher.getBeginTime());
+        seckillVoucher.setEndTime(voucher.getEndTime());
+        seckillVoucherService.save(seckillVoucher);
+    }
+```
+
+- 由于这里并没有后台管理页面，所以我们只能用POSTMAN模拟发送请求来新增秒杀券，请求路径`http://localhost:8081/voucher/seckill`， 请求方式POST。
+
+### 实现秒杀下单
+
+- 我们点击`限时抢购`，然后查看发送的请求
+
+```java
+请求网址: http://localhost:8080/api/voucher-order/seckill/10
+请求方法: POST
+```
+
+> - 那我们现在来分析一下怎么抢优惠券
+>   - 首先提交优惠券id，然后查询优惠券信息
+>   - 之后判断秒杀时间是否开始
+>     - 开始了，则判断是否有剩余库存
+>       - 有库存，那么删减一个库存
+>         - 然后创建订单
+>       - 无库存，则返回一个错误信息
+>     - 没开始，则返回一个错误信息
+
+- 根据流程编写实现秒杀下单的核心代码
+
+```java
+    /**
+     * 优惠卷秒杀
+     *
+     * @param voucherId
+     * @return
+     */
+    @Override
+    @Transactional
+    public Result seckillVoucher(Long voucherId) {
+        //1.查询优惠卷
+        SeckillVoucher voucher = seckillVoucherService.getById(voucherId);
+        //2.判断秒杀是否开始
+        if (voucher.getBeginTime().isAfter(LocalDateTime.now())) {
+            return Result.fail("秒杀尚未开始！");
+        }
+        //3.判断秒杀是否已经结束
+        if (voucher.getEndTime().isBefore(LocalDateTime.now())) {
+            return Result.fail("秒杀已经结束！");
+        }
+        //4.判断库存是否充足
+        if (voucher.getStock() < 1) {
+            return Result.fail("库存不足！");
+        }
+        //5.扣减库存
+        boolean success = seckillVoucherService.update().setSql("stock = stock -1").eq("voucher_id", voucherId).update();
+        if (!success) {
+            return Result.fail("库存不足！");
+        }
+        //6.创建订单
+        VoucherOrder voucherOrder = new VoucherOrder();
+        //6.1订单id
+        long orderId = redisIdWorker.nextId("order");
+        voucherOrder.setId(orderId);
+        //6.2用户id
+        Long userId = UserHolder.getUser().getId();
+        voucherOrder.setUserId(userId);
+        //6.3代金券id
+        voucherOrder.setVoucherId(voucherId);
+        save(voucherOrder);
+        return Result.ok(orderId);
+    }
+
+```
+
+### 超卖问题
+
+- 我们之前的代码其实是有问题的，当遇到高并发场景时，会出现超卖现象，我们可以用Jmeter开200个线程来模拟抢优惠券的场景，URL为 localhost:8081/voucher-order/seckill/10，请求方式为POST
+
+- 测试完毕之后，查看数据库中的订单表，我们明明只设置了100张优惠券，却有109条数据，去优惠券表查看，库存为-9，一共超卖了9张
+
+  ![75854738289](assets/1758547382896.png)
+
+- 那么如何解决这个问题呢？先看看我们的原代码
+
+  ```java
+          //4.判断库存是否充足
+          if (voucher.getStock() < 1) {
+              return Result.fail("库存不足！");
+          }
+          //5.扣减库存
+          boolean success = seckillVoucherService.update().setSql("stock = stock -1").eq("voucher_id", voucherId).update();
+          if (!success) {
+              return Result.fail("库存不足！");
+          }
+  ```
+
+
+- 假设现在只剩下一张优惠券，线程1过来查询库存，判断库存数大于1，但还没来得及去扣减库存，此时库线程2也过来查询库存，发现库存数也大于1，那么这两个线程都会进行扣减库存操作，最终相当于是多个线程都进行了扣减库存，那么此时就会出现超卖问题
+
+![75854764526](assets/1758547645267.png)
+
+- 超卖问题是典型的多线程安全问题，针对这一问题的常见解决方案就是加锁：而对于加锁，通常有两种解决方案
+
+  1. 悲观锁
+     - 悲观锁认为线程安全问题一定会发生，因此在操作数据之前先获取锁，确保线程串行执行
+     - 例如Synchronized、Lock等，都是悲观锁
+  2. 乐观锁
+     - 乐观锁认为线程安全问题不一定会发生，因此不加锁，只是在更新数据的时候再去判断有没有其他线程对数据进行了修改
+       - 如果没有修改，则认为自己是安全的，自己才可以更新数据
+       - 如果已经被其他线程修改，则说明发生了安全问题，此时可以重试或者异常
+
+- 悲观锁：悲观锁可以实现对于数据的串行化执行，比如syn，和lock都是悲观锁的代表，同时，悲观锁中又可以再细分为公平锁，非公平锁，可重入锁，等等
+
+- 乐观锁：乐观锁会有一个版本号，每次操作数据会对版本号+1，再提交回数据时，会去校验是否比之前的版本大1 ，如果大1 ，则进行操作成功，这套机制的核心逻辑在于，如果在操作过程中，版本号只比原来大1 ，那么就意味着操作过程中没有人对他进行过修改，他的操作就是安全的，如果不大1，则数据被修改过。
+
+  ![75854779981](assets/1758547799818.png)
+
+- 乐观锁的典型代表：就是CAS(Compare-And-Swap)，利用CAS进行无锁化机制加锁，var5 是操作前读取的内存值，while中的var1+var2 是预估值，如果预估值 == 内存值，则代表中间没有被人修改过，此时就将新值去替换内存值
+
+  ![75854800994](assets/1758548009941.png)
+
+- 乐观锁的改进
+
+  ```java
+          //5.扣减库存
+          boolean success = seckillVoucherService.update()
+                  .setSql("stock = stock -1") //set stock =stock -1
+                  .eq("voucher_id", voucherId).eq("stock",voucher.getStock())//where id = ? and stock = ?
+                  .update();
+          if (!success) {
+              return Result.fail("库存不足！");
+          }
+  ```
+
+通过Jmeter开200个线程，最后只卖了21份，剩余79份，这就是乐观锁的弊端，过于严格
+
+![75854913812](assets/1758549138127.png)
+
+![75854918163](assets/1758549181636.png)
+
+> 只要我扣减库存时的库存和之前我查询到的库存是一样的，就意味着没有人在中间修改过库存，那么此时就是安全的，但是以上这种方式通过测试发现会有很多失败的情况，失败的原因在于：在使用乐观锁过程中假设100个线程同时都拿到了100的库存，然后大家一起去进行扣减，但是100个人中只有1个人能扣减成功，其他的人在处理时，他们在扣减时，库存已经被修改过了，所以此时其他线程都会失败
+
+- 我们需要继续完善代码，修改我们的逻辑，我们可以只判断是否有剩余优惠券，即只要数据库中的库存大于0，都能顺利完成扣减库存操作
+
+  ```java
+          //4.判断库存是否充足
+          if (voucher.getStock() < 1) {
+              return Result.fail("库存不足！");
+          }
+          //5.扣减库存
+          boolean success = seckillVoucherService.update()
+                  .setSql("stock = stock -1") //set stock =stock -1
+                  .eq("voucher_id", voucherId).gt("stock",0)//where id = ? and stock > 0
+                  .update();
+  ```
+
+
+- 重启服务器，继续使用Jmeter进行测试，这次就能顺利将优惠券刚好抢空了
+
+  ![75854950452](assets/1758549504522.png)
+
+### 一人一单
+
+### 集群环境下的并发问题
+
+
+
