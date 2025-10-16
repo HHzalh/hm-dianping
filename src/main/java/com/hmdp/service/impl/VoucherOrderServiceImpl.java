@@ -85,6 +85,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         int count = query().eq("user_id", userId).eq("voucher_id", voucherId).count();
         //5.2判断订单是否存在
         if (count > 0) {
+
             //用户已经购买过了
             return Result.fail("用户已经购买过一次!");
         }
