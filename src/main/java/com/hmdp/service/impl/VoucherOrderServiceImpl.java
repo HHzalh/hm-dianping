@@ -8,8 +8,9 @@ import com.hmdp.mapper.VoucherOrderMapper;
 import com.hmdp.service.ISeckillVoucherService;
 import com.hmdp.service.IVoucherOrderService;
 import com.hmdp.utils.RedisIdWorker;
-import com.hmdp.utils.SimpleRedisLock;
 import com.hmdp.utils.UserHolder;
+import org.redisson.api.RLock;
+import org.redisson.api.RedissonClient;
 import org.springframework.aop.framework.AopContext;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
@@ -35,6 +36,9 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     @Resource
     private StringRedisTemplate stringRedisTemplate;
 
+    @Resource
+    private RedissonClient redissonClient;
+
     /**
      * 优惠卷秒杀
      *
@@ -59,9 +63,11 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         }
         Long userId = UserHolder.getUser().getId();
         // 创建锁对象
-        SimpleRedisLock redisLock = new SimpleRedisLock("order:" + userId, stringRedisTemplate);
+        //SimpleRedisLock redisLock = new SimpleRedisLock("order:" + userId, stringRedisTemplate);
+        RLock redisLock = redissonClient.getLock("order:" + userId);
         // 获取锁对象
-        boolean isLock = redisLock.tryLock(120);
+        //boolean isLock = redisLock.tryLock(120);
+        boolean isLock = redisLock.tryLock();
         // 加锁失败，说明当前用户开了多个线程抢优惠券，但是由于key是SETNX的，所以不能创建key，得等key的TTL到期或释放锁（删除key）
         if (!isLock) {
             return Result.fail("不允许抢多张优惠券！");
